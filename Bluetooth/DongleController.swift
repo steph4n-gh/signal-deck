@@ -22,7 +22,6 @@ final class DongleController: ObservableObject {
     }
 
     enum Codec: UInt16, CaseIterable, Identifiable {
-        case automatic = 0x003F
         case sbc = 0x0001
         case aptX = 0x0002
         case aptXAdaptive = 0x0004
@@ -33,7 +32,6 @@ final class DongleController: ObservableObject {
         var id: UInt16 { rawValue }
         var title: String {
             switch self {
-            case .automatic: "Automatic"
             case .sbc: "SBC"
             case .aptX: "aptX"
             case .aptXAdaptive: "aptX Adaptive"
@@ -92,7 +90,9 @@ final class DongleController: ObservableObject {
             let quality = try await read(0x08, minimum: 2)
             let leAudioState = try await optionalState(0x07, maximum: 4)
             let sinkTransport = try await optionalState(0x15, maximum: 3)
-            return Self(firmware: "\(version[0]).\(version[1]).\(version[2])",
+            // Build number is little-endian 16-bit when the dongle sends the second byte (btd700ctl).
+            let build = UInt16(version[2]) | (version.count > 3 ? UInt16(version[3]) << 8 : 0)
+            return Self(firmware: "\(version[0]).\(version[1]).\(build)",
                         connectionState: state[0], audioMode: audioMode, transport: mode[1],
                         supportedCodecMask: mask(selected), activeCodecMask: mask(active),
                         bitDepth: quality[0], sampleRate: quality[1],
@@ -139,8 +139,8 @@ final class DongleController: ObservableObject {
     }
 
     var activeCodecDescription: String {
-        guard activeCodecMask != 0 else { return "None" }
-        return Codec.allCases.first(where: { $0 != .automatic && $0.rawValue == activeCodecMask })?.title
+        guard connectionState >= 2, activeCodecMask != 0 else { return "None" }
+        return Codec.allCases.first(where: { $0.rawValue == activeCodecMask })?.title
             ?? String(format: "0x%04X", activeCodecMask)
     }
 
@@ -293,12 +293,7 @@ final class DongleController: ObservableObject {
     private func receive(_ bytes: [UInt8]) {
         guard bytes.count >= 4, bytes[0] == 0x34 else { return }
         if bytes[1] == 0xFC {
-            eventRefreshTask?.cancel()
-            eventRefreshTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                guard !Task.isCancelled else { return }
-                _ = await self?.refresh()
-            }
+            handleEvent(bytes[2], Array(bytes[4..<min(4 + Int(bytes[3]), bytes.count)]))
             return
         }
         guard bytes[1] == 0xFF, let pending, bytes[2] == pending.command else { return }
@@ -348,6 +343,61 @@ final class DongleController: ObservableObject {
         try Task.checkCancellation()
         guard available, deviceGeneration == generation else { throw DongleError.unavailable }
         return response
+    }
+
+    // Event payloads use the same layout as the matching status reply (captured on firmware 3.11.0).
+    private static let eventStatus: [UInt8: UInt8] = [
+        0x02: 0x01, 0x03: 0x03, 0x04: 0x05, 0x0F: 0x06, 0x10: 0x07, 0x11: 0x08, 0x16: 0x15
+    ]
+
+    private func handleEvent(_ id: UInt8, _ payload: [UInt8]) {
+        guard id != 0x17 else { return } // gaming availability is not shown
+        do {
+            guard let status = Self.eventStatus[id] else { throw DongleError.malformedResponse }
+            try applyStatus(status, payload)
+            if id == 0x0F {
+                // No codec event arrives when the link drops, so re-read the active codec.
+                let generation = deviceGeneration
+                Task { [weak self] in
+                    guard let self, let bytes = try? await self.command(0x05),
+                          self.available, self.deviceGeneration == generation else { return }
+                    try? self.applyStatus(0x05, bytes)
+                }
+            }
+        } catch {
+            eventRefreshTask?.cancel()
+            eventRefreshTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled else { return }
+                _ = await self?.refresh()
+            }
+        }
+    }
+
+    private func applyStatus(_ id: UInt8, _ bytes: [UInt8]) throws {
+        func mask() throws -> UInt16 {
+            guard let first = bytes.first else { throw DongleError.malformedResponse }
+            return UInt16(first) | (bytes.count > 1 ? UInt16(bytes[1]) << 8 : 0)
+        }
+        switch id {
+        case 0x06:
+            guard let first = bytes.first else { throw DongleError.malformedResponse }
+            connectionState = first
+        case 0x01:
+            guard bytes.count >= 2 else { throw DongleError.malformedResponse }
+            guard let mode = AudioMode(rawValue: bytes[0]) else { throw DongleError.unsupportedAudioMode(bytes[0]) }
+            audioMode = mode
+            transport = bytes[1]
+        case 0x03: supportedCodecMask = try mask()
+        case 0x05: activeCodecMask = try mask()
+        case 0x07: leAudioState = bytes.first.flatMap { $0 <= 4 ? $0 : nil }
+        case 0x08:
+            guard bytes.count >= 2 else { throw DongleError.malformedResponse }
+            bitDepth = bytes[0]
+            sampleRate = bytes[1]
+        case 0x15: sinkTransport = bytes.first.flatMap { $0 <= 3 ? $0 : nil }
+        default: break
+        }
     }
 
     @discardableResult func refresh() async -> Bool {
@@ -401,7 +451,10 @@ final class DongleController: ObservableObject {
         }
     }
 
+    // Firmware 3.11.0 takes a single-codec mask and rejects (status 1) multi-codec masks and the
+    // codec already in use, so there is no "automatic" and re-selecting the active codec is a no-op.
     func setCodec(_ codec: Codec) async {
+        guard codec.rawValue != activeCodecMask else { return }
         beginOperation()
         defer { endOperation() }
         do {
